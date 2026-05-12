@@ -24,16 +24,19 @@ TOKEN_CACHE_FILE = "meineapp_token_cache.json"
 
 
 def base64url(data: bytes) -> str:
+    """Encode bytes with the URL-safe Base64 variant used by the appid header."""
     return base64.b64encode(data).decode("ascii").replace("+", "-").replace("/", "_").rstrip("=")
 
 
 def decode_jwt(token: str) -> dict[str, Any]:
+    """Decode the JWT payload without validating the signature."""
     payload = token.split(".")[1]
     payload += "=" * (-len(payload) % 4)
     return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
 
 
 def access_token_is_valid(token: str, leeway_seconds: int = 60) -> bool:
+    """Return True if the cached access token is still valid for the leeway window."""
     try:
         decoded = decode_jwt(token)
         return int(decoded.get("exp", 0)) > int(time.time()) + leeway_seconds
@@ -42,6 +45,7 @@ def access_token_is_valid(token: str, leeway_seconds: int = 60) -> bool:
 
 
 def app_info(timestamp: int, device_secret: str | None = None) -> dict[str, Any]:
+    """Build the device metadata block that is embedded in the signed appid header."""
     info = {
         "device.model": platform.machine() or "unknown",
         "device.cordova": "4.5.5",
@@ -58,12 +62,20 @@ def app_info(timestamp: int, device_secret: str | None = None) -> dict[str, Any]
 
 
 def generate_device_secret() -> str:
+    """Create a local device secret for future appid signatures."""
     return str(uuid.uuid4())
 
 
 def build_signed_appid(username: str, secret: str, signing_key: str | None = None) -> str:
+    """Create the appid header value expected by the DVAG backend.
+
+    During SMS registration the one-time SMS code signs the generated device secret.
+    During normal login the persisted device secret signs the appid header.
+    """
     signing_key = signing_key or secret
     timestamp = int(time.time() * 1000)
+
+    # The backend expects a Base64URL-encoded JSON payload and a Base64URL HMAC.
     info_part = base64url(json.dumps(app_info(timestamp, secret if signing_key != secret else None), separators=(",", ":")).encode("utf-8"))
     signature_input = f"{ANDROID_APP_ID};{username.lower()};{timestamp};{signing_key}"
     digest = hmac.new(signing_key.encode("utf-8"), signature_input.encode("utf-8"), hashlib.sha256).digest()
@@ -71,6 +83,7 @@ def build_signed_appid(username: str, secret: str, signing_key: str | None = Non
 
 
 def request_token(username: str, password: str, client_id: str, app_secret: str | None = None) -> requests.Response:
+    """Request an OAuth token with either the normal client or the setup client."""
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
@@ -97,6 +110,7 @@ def request_token(username: str, password: str, client_id: str, app_secret: str 
 
 
 def refresh_token(username: str, refresh_token_value: str, app_secret: str | None = None) -> requests.Response:
+    """Refresh the cached access token without asking for the password again."""
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
@@ -116,6 +130,7 @@ def refresh_token(username: str, refresh_token_value: str, app_secret: str | Non
 
 
 def load_token_cache() -> dict | None:
+    """Load the local token cache if it exists."""
     if not os.path.exists(TOKEN_CACHE_FILE):
         return None
     with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -123,6 +138,7 @@ def load_token_cache() -> dict | None:
 
 
 def save_token_cache(username: str, token_data: dict, app_secret: str | None = None) -> None:
+    """Persist token data and the device secret for later runs."""
     cache = {
         "username": username,
         "app_secret": app_secret or os.getenv("MEINEAPP_APP_SECRET"),
@@ -134,6 +150,7 @@ def save_token_cache(username: str, token_data: dict, app_secret: str | None = N
 
 
 def get_cached_or_refreshed_token() -> dict | None:
+    """Return a usable token from cache, refreshing it if needed and possible."""
     cache = load_token_cache()
     if not cache:
         return None
@@ -163,6 +180,7 @@ def get_cached_or_refreshed_token() -> dict | None:
 
 
 def login(username: str, password: str) -> dict:
+    """Log in with the normal client and start appid setup if the backend requires it."""
     response = request_token(username, password, CLIENT_ID, os.getenv("MEINEAPP_APP_SECRET"))
 
     if response.status_code != 200:
@@ -179,6 +197,7 @@ def login(username: str, password: str) -> dict:
 
 
 def auth_headers(access_token: str, content_type: str | None = None) -> dict[str, str]:
+    """Build common API headers for authenticated JSON requests."""
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}",
@@ -190,6 +209,7 @@ def auth_headers(access_token: str, content_type: str | None = None) -> dict[str
 
 
 def get_json(access_token: str, path: str, params: dict[str, str] | None = None) -> dict:
+    """Perform a GET request and fail loudly with the backend response on errors."""
     response = requests.get(
         f"{BASE_URL}{path}",
         headers=auth_headers(access_token),
@@ -206,6 +226,7 @@ def get_json(access_token: str, path: str, params: dict[str, str] | None = None)
 
 
 def fetch_financial_overview(access_token: str, zuordnung: str = "MEINE") -> dict:
+    """Fetch the financial overview for the current user."""
     portos_id = decode_jwt(access_token)["sub"]
     return get_json(
         access_token,
@@ -215,11 +236,13 @@ def fetch_financial_overview(access_token: str, zuordnung: str = "MEINE") -> dic
 
 
 def save_json(path: str, data: dict) -> None:
+    """Write a JSON file in a readable format."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def maybe_run_appid_setup(username: str, password: str, failed_response: requests.Response) -> dict | None:
+    """Inspect login errors and run the SMS appid registration flow if requested."""
     try:
         error = failed_response.json().get("error")
     except ValueError:
@@ -236,6 +259,7 @@ def maybe_run_appid_setup(username: str, password: str, failed_response: request
 
 
 def setup_appid(username: str, password: str) -> dict:
+    """Register a new appid by using the setup client and a one-time SMS code."""
     setup_response = request_token(username, password, SETUP_CLIENT_ID)
     if setup_response.status_code != 200:
         print("Setup-Login fehlgeschlagen")
@@ -248,6 +272,7 @@ def setup_appid(username: str, password: str) -> dict:
     decoded = decode_jwt(access_token)
     portos_id = decoded["sub"]
 
+    # The setup token can read the phone numbers that are already known for the account.
     phone_response = requests.get(
         f"{BASE_URL}/kunde/rest/v2/kunden/{portos_id}/mobilnummern",
         headers=auth_headers(access_token),
@@ -265,6 +290,8 @@ def setup_appid(username: str, password: str) -> dict:
     else:
         mobile_number = input("Mobilnummer exakt aus der Antwort eingeben: ").strip()
     encoded_mobile_number = quote(mobile_number, safe="")
+
+    # Request an SMS code for the selected phone number.
     sms_response = requests.post(
         f"{BASE_URL}/registrierer/rest/v4/kunden/{portos_id}/mobilnummern/{encoded_mobile_number}/smscodes",
         headers=auth_headers(access_token),
@@ -278,6 +305,9 @@ def setup_appid(username: str, password: str) -> dict:
 
     sms_code = input("SMS-Code: ").strip()
     device_secret = generate_device_secret()
+
+    # The SMS code signs the first appid payload. The generated device secret is then
+    # persisted and used for future appid signatures during normal login.
     signed_app_info = build_signed_appid(username, device_secret, signing_key=sms_code)
     appid_response = requests.post(
         f"{BASE_URL}/registrierer/rest/v4/authentifizierung/appId",
@@ -323,7 +353,7 @@ if __name__ == "__main__":
         save_token_cache(username, token_data)
 
     access_token = token_data.get("access_token")
-    refresh_token = token_data.get("refresh_token")
+    refresh_token_value = token_data.get("refresh_token")
 
     if not access_token:
         print("Kein access_token gefunden.")
@@ -337,7 +367,7 @@ if __name__ == "__main__":
     print("Bearer Token:")
     print(access_token)
 
-    if refresh_token:
+    if refresh_token_value:
         print()
         print("Refresh Token wurde ebenfalls empfangen.")
 
